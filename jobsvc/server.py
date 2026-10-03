@@ -14,6 +14,15 @@
     {"op": "read", "id": str, "stream": "stdout"|"stderr",
      "offset": int, "max_bytes"?: int}
         -> {"ok": true, "data": <base64>, ...游标字段...}
+    {"op": "input", "id": str, "seq": int, "data": <base64>}
+        -> {"ok": true, "receipt": {seq,size,written,status,reason}}
+           seq 从 0 开始连续；同 seq 同内容重试幂等、异内容拒绝；
+           status: pending|delivered|failed
+    {"op": "close_input", "id": str}
+        -> {"ok": true, "input": {closing, closed}}
+           拒绝新片段；已接受片段写完后才向子进程发送 EOF
+    {"op": "input_receipts", "id": str}
+        -> {"ok": true, "receipts": [<receipt>...]}
     {"op": "shutdown"}
 
 输出以 base64 传输，天然支持二进制内容与含换行的文本。
@@ -204,13 +213,19 @@ class UnixServer:
             )
             return {"ok": True, "job": job.snapshot()}
         if op == "input":
-            try:data=base64.b64decode(req["data"],validate=True)
-            except (ValueError,TypeError) as exc:raise JobError('Invalid base64') from exc
-            return {"ok":True,"receipt":svc.write_input(req["id"],req["seq"],data)}
+            seq = req.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise JobError("seq 必须是非负整数")
+            try:
+                data = base64.b64decode(req["data"], validate=True)
+            except (ValueError, TypeError) as exc:
+                raise JobError("data 必须是合法 base64") from exc
+            receipt = svc.write_input(req["id"], seq, data)
+            return {"ok": True, "receipt": receipt}
         if op == "close_input":
-            return {"ok":True,"input":svc.close_input(req["id"])}
+            return {"ok": True, "input": svc.close_input(req["id"])}
         if op == "input_receipts":
-            return {"ok":True,"receipts":svc.input_receipts(req["id"])}
+            return {"ok": True, "receipts": svc.input_receipts(req["id"])}
         if op == "status":
             return {"ok": True, "job": svc.snapshot(req["id"])}
         if op == "list":

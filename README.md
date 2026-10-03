@@ -23,7 +23,7 @@ jobsvc/            服务实现（仅标准库，Python 3.10+）
   client.py        客户端 SDK
   cli.py           命令行
 scripts/           预定义测试命令（白名单的唯一可执行目标）
-tests/             33 个测试
+tests/             33 个基础测试 + 33 个交互输入测试
 ```
 
 ## 快速开始
@@ -49,6 +49,8 @@ python -m jobsvc shutdown
 
 | 命令 | 参数 | 用途 |
 |---|---|---|
+| `stdin_echo` | — | stderr 打印 ready 后 `cat` 回显 stdin（交互输入） |
+| `stdin_wait` | `seconds[1..60]` | 不读 stdin，睡眠后退出（未送达回执场景） |
 | `echo` | — | stdout 一行，退出 0 |
 | `fail` | — | stderr 一行，退出 7 |
 | `slow` | `seconds[1..3600]` | 睡眠，用于超时/排队/取消 |
@@ -104,7 +106,8 @@ queued  -> cancelled           # 排队中取消，作业永不启动
 
 Unix 域流式套接字，每行一个 JSON 请求/响应（仅本机，文件权限 0600）：
 
-`submit` / `status` / `list` / `wait` / `cancel` / `read` / `shutdown`。
+`submit` / `status` / `list` / `wait` / `cancel` / `read` /
+`input` / `close_input` / `input_receipts` / `shutdown`。
 `wait` 在服务端阻塞到终态（或给定超时）；`shutdown` 会取消所有排队作业、
 杀死全部运行中进程组并删除套接字。
 
@@ -114,11 +117,40 @@ Unix 域流式套接字，每行一个 JSON 请求/响应（仅本机，文件�
 python -m unittest discover -s tests -v
 ```
 
-33 个用例覆盖：白名单与参数校验、非零退出码、stderr 海量洪泛、
+33 个基础用例覆盖：白名单与参数校验、非零退出码、stderr 海量洪泛、
 两路交替写、输出合计上限（单路与双路）、超时杀整组、SIGKILL 升级、
 被收养孙进程回收、取消幂等、退出-取消竞争、排队作业取消、两槽 FIFO
 推进、游标分页/重读一致性、运行中读取不阻塞、关闭时整组回收，
 以及经真实 Unix 套接字的端到端流程。
 
+另有 33 个交互输入用例（`tests/test_input*.py`）覆盖：同序号同内容
+幂等重试不重复写入、异内容/跳号/超片拒绝、64KiB 单片与 1MiB 背压上限、
+部分写入后完整字节与顺序、空片段、关闭后拒绝新增且排空后才 EOF、
+输出与输入交错不互堵、取消/超时/退出/断管时未送达片段的 failed 回执与
+原因、排队中写输入与排队中取消，以及经真实套接字/base64 的端到端流程。
+
 ## 交互输入
-stdin_echo 和 stdin_wait 为注册的交互命令。客户端 write_input(id,seq,bytes) 从序号0开始连续接受片段，input_receipts查询实际写出字节和状态；同序号同内容重试不重新发送，异内容拒绝。close_input停止接受新增并在已接受片段完成后发送EOF。取消、退出或管道关闭使未送达片段成为失败回执。单片上限64KiB，待处理合计上限1MiB。
+
+`stdin_echo` 与 `stdin_wait` 是注册的交互命令（stdin 为管道，其余命令
+stdin 接 `/dev/null`，输入操作被拒绝）。
+
+- **分片输送**：`write_input(id, seq, bytes)`（协议 op `input`，载荷
+  base64）接受从 **0 开始连续**序号的片段；单片上限 **64KiB**，尚未写完
+  的片段合计上限 **1MiB**（背压超限拒绝，稍后按同序号重试即可）。
+- **幂等重试 / 冲突拒绝**：同 `seq` + 同内容重发返回**同一个片段回执**，
+  绝不重复写入（因此“只写到一半就返回、客户端重试”不会把前半段写两次）；
+  同 `seq` + 异内容、跳号一律拒绝。
+- **回执**：`input_receipts(id)` 按 seq 返回每片的
+  `seq / size / written / status / reason`。`status` 为
+  `pending`（已接受，`written` 为管道已实际接受的部分字节）、
+  `delivered`（`written == size`，全部字节确实写进管道）、
+  `failed`（`reason` ∈ `cancelled` / `timed_out` / `output_limit` /
+  `exited` / `broken_pipe` / `write_error`，`written` 为已写字节）。
+  **取消、超时、进程退出或管道断裂后，未送达片段一定是 failed 并带原因**，
+  不会谎报成功。
+- **结束输入**：`close_input(id)` 之后拒绝新增片段，但监控线程会把
+  **已接受片段按序全部写完**再关闭管道（EOF），不截断在途内容；
+  `cat` 等程序因此能收到完整输入后自然退出。管道写端为**非阻塞**并由
+  监控线程的同一个 `poll` 驱动，子进程不读取导致管道满时，输出读取与
+  取消/超时检查（最长一个 poll tick）都不会被阻塞；两路输出先 EOF 而
+  stdin 仍开时也继续 poll，不再漏掉 EOF 与取消。

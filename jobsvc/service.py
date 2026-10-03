@@ -248,17 +248,23 @@ class JobService:
                     max_bytes: int = 1 << 16) -> dict:
         return self.get(job_id).read_output(stream, offset, max_bytes)
 
-    def write_input(self,job_id,seq,data):
-        job=self.get(job_id)
+    def write_input(self, job_id: str, seq: int, data: bytes) -> dict:
+        job = self.get(job_id)
         if job.command not in registry.INTERACTIVE:
-            raise InvalidArguments('Command is not interactive')
-        return job.input.admit(seq,data)
+            raise InvalidArguments("该命令不接受交互输入")
+        return job.input.admit(seq, data)
 
-    def close_input(self,job_id):
-        return self.get(job_id).input.request_close()
+    def close_input(self, job_id: str) -> dict:
+        job = self.get(job_id)
+        if job.command not in registry.INTERACTIVE:
+            raise InvalidArguments("该命令不接受交互输入")
+        return job.input.request_close()
 
-    def input_receipts(self,job_id):
-        return self.get(job_id).input.receipts()
+    def input_receipts(self, job_id: str) -> list[dict]:
+        job = self.get(job_id)
+        if job.command not in registry.INTERACTIVE:
+            raise InvalidArguments("该命令不接受交互输入")
+        return job.input.receipts()
 
     # ---- 取消 -----------------------------------------------------------
 
@@ -359,10 +365,14 @@ class JobService:
             os.set_blocking(fd, False)
             poll.register(fd, select.POLLIN)
         open_fds = 2
-        input_fd=proc.stdin.fileno() if proc.stdin else None
-        input_registered=False
+        stdin_fh = proc.stdin
+        input_fd = stdin_fh.fileno() if stdin_fh is not None else None
+        input_registered = False
+        stdin_open = input_fd is not None
         if input_fd is not None:
-            os.set_blocking(input_fd,True)
+            # 必须非阻塞：子进程不读取时管道会满，阻塞写会卡住取消与
+            # 输出读取；写多少记多少，绝不虚构“已送达”。
+            os.set_blocking(input_fd, False)
 
 
         with job.lock:
@@ -386,21 +396,45 @@ class JobService:
                     wait = min(wait, 0.01)
 
                 if input_fd is not None:
-                    needed=job.input.has_work()
-                    if needed and not input_registered:
-                        poll.register(input_fd,select.POLLOUT)
-                        input_registered=True
-                    elif not needed and input_registered:
+                    # 仅在有片段待写时订阅 POLLOUT；管道满时 poll 会等
+                    # 出空间，同时继续收取输出、响应取消（stdin 非阻塞）。
+                    if job.input.wants_write() and not input_registered:
+                        poll.register(input_fd, select.POLLOUT)
+                        input_registered = True
+                    elif not job.input.wants_write() and input_registered:
                         poll.unregister(input_fd)
-                        input_registered=False
-                events = poll.poll(wait * 1000) if open_fds else []
+                        input_registered = False
+                    # 已请求结束：等已接受片段全部写完，此刻才发 EOF，
+                    # 绝不截断在途字节。
+                    if stdin_open and job.input.should_eof_now():
+                        if input_registered:
+                            poll.unregister(input_fd)
+                            input_registered = False
+                        self._close_stdin(stdin_fh)
+                        stdin_open = False
+                        input_fd = None
+
+                # stdin 仍开着时必须继续 poll：两路输出 EOF 而输入未结束
+                # 的情况下（如 cat 等待输入），停 poll 会永久漏掉 EOF/取消。
+                events = (
+                    poll.poll(wait * 1000)
+                    if open_fds or stdin_open else []
+                )
                 for fd, _ev in events:
-                    if fd==input_fd:
-                        if job.input.drain(fd):
-                            poll.unregister(fd)
-                            input_registered=False
-                            proc.stdin.close()
-                            input_fd=None
+                    if fd == input_fd:
+                        action = job.input.write_ready(fd)
+                        if action in ("eof", "broken"):
+                            if input_registered:
+                                poll.unregister(input_fd)
+                                input_registered = False
+                            self._close_stdin(stdin_fh)
+                            stdin_open = False
+                            input_fd = None
+                        elif action == "progress" and not job.input.wants_write():
+                            # 队头写完、暂无后续片段：退订等新片段到达，
+                            # 避免无数据时 POLLOUT 水平触发空转。
+                            poll.unregister(input_fd)
+                            input_registered = False
                         continue
                     idx, name, fh = fds[fd]
                     try:
@@ -439,16 +473,23 @@ class JobService:
                         sigkill_sent = True
                         kill_deadline = time.monotonic() + self.kill_grace
 
-                if (rc is not None or kill_reason is not None) and input_fd is not None:
-                    job.input.finish('exited' if kill_reason is None else kill_reason.value)
-                    if input_registered:poll.unregister(input_fd)
-                    proc.stdin.close()
-                    input_fd=None
-                    input_registered=False
+                # 进程确定消失（自然退出或已决定杀死）时，未写完的片段
+                # 永远无法送达：给出明确失败回执，而不是谎称成功。
+                if (rc is not None or kill_reason is not None) and stdin_open:
+                    job.input.finish(
+                        "exited" if kill_reason is None
+                        else kill_reason.value)
+                    if input_registered:
+                        poll.unregister(input_fd)
+                        input_registered = False
+                    self._close_stdin(stdin_fh)
+                    stdin_open = False
+                    input_fd = None
                 if rc is not None and open_fds == 0:
                     break
-                if open_fds == 0 and not events:
-                    # 两路管道都已 EOF 但进程还在（极少见）：避免空转。
+                if open_fds == 0 and not stdin_open and not events:
+                    # 管道都已 EOF 且输入已结束但进程还在（极少见）：
+                    # 避免空转。
                     time.sleep(min(_POLL_TICK, 0.02))
         finally:
             # 无论如何确保进程被回收、句柄被关闭、槽位被释放。
@@ -458,9 +499,10 @@ class JobService:
                 proc.wait(timeout=self.kill_grace + 5)
             except subprocess.TimeoutExpired:
                 pass
-            if proc.stdin:
-                proc.stdin.close()
-            job.input.finish('exited' if kill_reason is None else kill_reason.value)
+            # 收尾兜底：未送达片段失败化、stdin 关闭（正常路径已完成，幂等）。
+            job.input.finish(
+                "exited" if kill_reason is None else kill_reason.value)
+            self._close_stdin(stdin_fh)
             for fh in streams:
                 try:
                     fh.close()
@@ -485,6 +527,16 @@ class JobService:
     def _over_output_limit(self, job: Job) -> bool:
         with job.lock:
             return job.produced_total >= job.output_max_bytes
+
+    @staticmethod
+    def _close_stdin(stdin_fh) -> None:
+        """关闭作业 stdin 管道写端（向子进程发送 EOF）。重复调用安全。"""
+        if stdin_fh is None:
+            return
+        try:
+            stdin_fh.close()
+        except OSError:
+            pass
 
     @staticmethod
     def _signal_group(job: Job, sig: int) -> None:

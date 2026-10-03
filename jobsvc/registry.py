@@ -63,7 +63,10 @@ _REGISTRY: dict[str, CommandEntry] = {
     e.name: e
     for e in (
         CommandEntry("stdin_echo", "stdin_echo.sh"),
-        CommandEntry("stdin_wait", "stdin_wait.sh"),
+        CommandEntry(
+            "stdin_wait", "stdin_wait.sh",
+            (IntParam("seconds", 1, 60),),
+        ),
         CommandEntry("echo", "echo.sh"),
         CommandEntry("fail", "fail.sh"),
         CommandEntry("slow", "slow.sh", (IntParam("seconds", 1, 3600),)),
