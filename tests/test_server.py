@@ -114,6 +114,75 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(final["state"], "timed_out")
             wait_group_gone(final["pid"])
 
+    def test_input_e2e_fragments_retries_close_and_receipts(self):
+        with JobClient(self.sock_path) as c:
+            job = c.submit("stdin_echo", timeout=10,
+                           output_max_bytes=4 * 1024 * 1024)
+            time.sleep(0.2)
+            self.assertEqual(c.status(job["id"])["state"], "running")
+            fragments = [b"line0\n", bytes(range(256)), b"tail" * 2000]
+            for i, frag in enumerate(fragments):
+                r = c.write_input(job["id"], i, frag)
+                self.assertEqual(r["seq"], i)
+                self.assertEqual(r["size"], len(frag))
+            # 同序号同内容重放：同一回执，不重复发送。
+            replay = c.write_input(job["id"], 1, fragments[1])
+            self.assertEqual(replay["size"], len(fragments[1]))
+            # 异内容重试：协议层错误。
+            with self.assertRaises(ServiceError) as cm:
+                c.write_input(job["id"], 1, b"different")
+            self.assertEqual(cm.exception.type_name, "InvalidArguments")
+            # 越序同样拒绝。
+            with self.assertRaises(ServiceError):
+                c.write_input(job["id"], 99, b"x")
+            info = c.close_input(job["id"])
+            self.assertTrue(info["closing"])
+            # 关闭后拒绝新增。
+            with self.assertRaises(ServiceError):
+                c.write_input(job["id"], len(fragments), b"late")
+            final = c.wait(job["id"], timeout=10)
+            self.assertEqual(final["state"], "exited")
+            stdout = b"".join(c.iter_output(job["id"], "stdout"))
+            self.assertEqual(stdout, b"".join(fragments))
+            receipts = c.input_receipts(job["id"])
+            self.assertEqual(len(receipts), 3)
+            for i, frag in enumerate(fragments):
+                self.assertEqual(receipts[i]["written"], len(frag))
+                self.assertEqual(receipts[i]["status"], "delivered")
+
+    def test_input_cancel_e2e_undelivered_reports_failed(self):
+        with JobClient(self.sock_path) as c:
+            job = c.submit("stdin_wait", timeout=30)
+            time.sleep(0.2)
+            # stdin_wait 不读 stdin；多发片段制造积压。
+            accepted = 0
+            for i in range(8):
+                try:
+                    c.write_input(job["id"], i, b"q" * 60000)
+                    accepted += 1
+                except ServiceError:
+                    break
+            self.assertGreaterEqual(accepted, 1)
+            t0 = time.time()
+            snap = c.cancel(job["id"], timeout=10)
+            self.assertLess(time.time() - t0, 8.0)  # 取消不卡死
+            self.assertEqual(snap["state"], "cancelled")
+            wait_group_gone(snap["pid"])
+            receipts = c.input_receipts(job["id"])
+            self.assertEqual(len(receipts), accepted)
+            for r in receipts:
+                if r["written"] < r["size"]:
+                    self.assertEqual(r["status"], "failed")
+                    self.assertEqual(r["reason"], "cancelled")
+
+    def test_non_interactive_command_rejects_input_e2e(self):
+        with JobClient(self.sock_path) as c:
+            job = c.submit("echo")
+            c.wait(job["id"], timeout=5)
+            with self.assertRaises(ServiceError) as cm:
+                c.write_input(job["id"], 0, b"x")
+            self.assertEqual(cm.exception.type_name, "InvalidArguments")
+
     def test_list_and_shutdown(self):
         with JobClient(self.sock_path) as c:
             c.submit("echo")

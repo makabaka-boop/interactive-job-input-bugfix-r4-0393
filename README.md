@@ -23,7 +23,7 @@ jobsvc/            服务实现（仅标准库，Python 3.10+）
   client.py        客户端 SDK
   cli.py           命令行
 scripts/           预定义测试命令（白名单的唯一可执行目标）
-tests/             33 个测试
+tests/             测试（核心 + 交互输入 + 套接字端到端）
 ```
 
 ## 快速开始

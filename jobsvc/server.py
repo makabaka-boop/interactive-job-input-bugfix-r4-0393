@@ -14,6 +14,14 @@
     {"op": "read", "id": str, "stream": "stdout"|"stderr",
      "offset": int, "max_bytes"?: int}
         -> {"ok": true, "data": <base64>, ...游标字段...}
+    {"op": "input", "id": str, "seq": int, "data": <base64>}
+        -> {"ok": true, "receipt": {seq,size,written,status,reason}}
+           同序号同内容重试返回同一张回执；异内容/越序/超限被拒。
+    {"op": "close_input", "id": str}
+        -> {"ok": true, "input": {closing, closed}}
+           已接受片段排空后才发 EOF，之后拒绝新增。
+    {"op": "input_receipts", "id": str}
+        -> {"ok": true, "receipts": [...]}  # 取消/退出后未送达片段为 failed
     {"op": "shutdown"}
 
 输出以 base64 传输，天然支持二进制内容与含换行的文本。
@@ -204,13 +212,25 @@ class UnixServer:
             )
             return {"ok": True, "job": job.snapshot()}
         if op == "input":
-            try:data=base64.b64decode(req["data"],validate=True)
-            except (ValueError,TypeError) as exc:raise JobError('Invalid base64') from exc
-            return {"ok":True,"receipt":svc.write_input(req["id"],req["seq"],data)}
+            try:
+                raw = req["data"]
+                seq = req["seq"]
+            except KeyError as exc:
+                raise JobError(f"缺少字段: {exc.args[0]}") from exc
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+                raise JobError("seq 必须是非负整数")
+            if not isinstance(raw, str):
+                raise JobError("data 必须是 base64 字符串")
+            try:
+                data = base64.b64decode(raw, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise JobError("data 不是合法的 base64") from exc
+            return {"ok": True,
+                    "receipt": svc.write_input(req["id"], seq, data)}
         if op == "close_input":
-            return {"ok":True,"input":svc.close_input(req["id"])}
+            return {"ok": True, "input": svc.close_input(req["id"])}
         if op == "input_receipts":
-            return {"ok":True,"receipts":svc.input_receipts(req["id"])}
+            return {"ok": True, "receipts": svc.input_receipts(req["id"])}
         if op == "status":
             return {"ok": True, "job": svc.snapshot(req["id"])}
         if op == "list":

@@ -24,8 +24,18 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
-from .input import InputChannel
 from . import registry
+from .input import (
+    EOF_SENT,
+    BROKEN_PIPE,
+    REASON_BROKEN_PIPE,
+    REASON_CANCELLED,
+    REASON_EXITED,
+    REASON_OUTPUT_LIMIT,
+    REASON_SPAWN_ERROR,
+    REASON_TIMED_OUT,
+    InputChannel,
+)
 from .states import CancelTimeout, InvalidArguments, JobNotFound, JobState
 
 # 单路一次最多读取量；够大，减少被写满的管道反压次数。
@@ -248,16 +258,19 @@ class JobService:
                     max_bytes: int = 1 << 16) -> dict:
         return self.get(job_id).read_output(stream, offset, max_bytes)
 
-    def write_input(self,job_id,seq,data):
-        job=self.get(job_id)
+    def write_input(self, job_id, seq, data):
+        job = self.get(job_id)
         if job.command not in registry.INTERACTIVE:
-            raise InvalidArguments('Command is not interactive')
-        return job.input.admit(seq,data)
+            raise InvalidArguments("Command is not interactive")
+        return job.input.admit(seq, data)
 
-    def close_input(self,job_id):
-        return self.get(job_id).input.request_close()
+    def close_input(self, job_id):
+        job = self.get(job_id)
+        if job.command not in registry.INTERACTIVE:
+            raise InvalidArguments("Command is not interactive")
+        return job.input.request_close()
 
-    def input_receipts(self,job_id):
+    def input_receipts(self, job_id):
         return self.get(job_id).input.receipts()
 
     # ---- 取消 -----------------------------------------------------------
@@ -294,7 +307,7 @@ class JobService:
             pass
         job.eof[STDOUT] = job.eof[STDERR] = True
         job.cancel_event.set()
-        job.input.finish('cancelled')
+        job.input.finish(REASON_CANCELLED)
         job.terminal_event.set()
 
     # ---- 调度 -----------------------------------------------------------
@@ -332,6 +345,25 @@ class JobService:
             self._active -= 1
             self._wake.notify()
 
+    @staticmethod
+    def _close_stdin(job: Job, proc: subprocess.Popen,
+                     poll, registered: bool) -> None:
+        """从 poll 摘除 stdin 并关闭写端（向子进程发出 EOF / 释放管道）。
+
+        每个路径只关一次：fd 在 Popen 关闭后可能被复用，因此调用方必须
+        先 unregister 再 close，并把自己的 input_fd 置空。
+        """
+        if registered and poll is not None:
+            try:
+                poll.unregister(proc.stdin.fileno())
+            except (OSError, ValueError):
+                pass
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
     # ---- 单作业监管 -----------------------------------------------------
 
     def _monitor(self, job: Job) -> None:
@@ -359,10 +391,14 @@ class JobService:
             os.set_blocking(fd, False)
             poll.register(fd, select.POLLIN)
         open_fds = 2
-        input_fd=proc.stdin.fileno() if proc.stdin else None
-        input_registered=False
+        stdin = proc.stdin
+        input_fd = stdin.fileno() if stdin is not None else None
+        input_registered = False
         if input_fd is not None:
-            os.set_blocking(input_fd,True)
+            # 关键：stdin 必须非阻塞。阻塞写会在管道写满（子进程不读）时
+            # 卡死唯一的监控线程——取消检查、超时检查和两路输出读取都会
+            # 随之停摆（“命令等待输入时取消和输出读取卡住”）。
+            os.set_blocking(input_fd, False)
 
 
         with job.lock:
@@ -385,22 +421,45 @@ class JobService:
                 if job.cancel_event.is_set():
                     wait = min(wait, 0.01)
 
+                # stdin 仅在有工作时挂进 poll：写片段要 POLLOUT，EOF
+                # 排在队列排空之后由 drain 决定。没有输出 fd 且没有输入
+                # 工作时不能进 poll()（没有监听对象），改为短睡眠等事件。
                 if input_fd is not None:
-                    needed=job.input.has_work()
+                    needed = job.input.has_work()
                     if needed and not input_registered:
-                        poll.register(input_fd,select.POLLOUT)
-                        input_registered=True
+                        poll.register(input_fd, select.POLLOUT)
+                        input_registered = True
                     elif not needed and input_registered:
                         poll.unregister(input_fd)
-                        input_registered=False
-                events = poll.poll(wait * 1000) if open_fds else []
+                        input_registered = False
+                if open_fds > 0 or input_registered:
+                    events = poll.poll(wait * 1000)
+                else:
+                    events = []
+                    if wait > 0:
+                        time.sleep(min(wait, _POLL_TICK))
                 for fd, _ev in events:
-                    if fd==input_fd:
-                        if job.input.drain(fd):
-                            poll.unregister(fd)
-                            input_registered=False
-                            proc.stdin.close()
-                            input_fd=None
+                    if fd == input_fd:
+                        if _ev & (select.POLLHUP | select.POLLERR):
+                            # 读端先没了。先看进程是否已自然退出——退出
+                            # 是更准确的裁决理由；否则按写端破裂处理。
+                            rc_now = proc.poll()
+                            reason = (REASON_EXITED if rc_now is not None
+                                      else REASON_BROKEN_PIPE)
+                            job.input.finish(reason)
+                            self._close_stdin(job, proc, poll,
+                                              input_registered)
+                            input_fd = None
+                            input_registered = False
+                            continue
+                        action = job.input.drain(fd)
+                        if action in (EOF_SENT, BROKEN_PIPE):
+                            # EOF：已接受片段全部送达后才走到这里，绝不
+                            # 截断；破裂：未送达片段已被标 failed。
+                            self._close_stdin(job, proc, poll,
+                                              input_registered)
+                            input_fd = None
+                            input_registered = False
                         continue
                     idx, name, fh = fds[fd]
                     try:
@@ -439,12 +498,21 @@ class JobService:
                         sigkill_sent = True
                         kill_deadline = time.monotonic() + self.kill_grace
 
+                # 进程已退出或已裁决杀死：stdin 不再可能被消费，立即停止
+                # 输入并把未送达片段如实记为失败（原因即终局来源）。
                 if (rc is not None or kill_reason is not None) and input_fd is not None:
-                    job.input.finish('exited' if kill_reason is None else kill_reason.value)
-                    if input_registered:poll.unregister(input_fd)
-                    proc.stdin.close()
-                    input_fd=None
-                    input_registered=False
+                    if kill_reason is JobState.CANCELLED:
+                        reason = REASON_CANCELLED
+                    elif kill_reason is JobState.TIMED_OUT:
+                        reason = REASON_TIMED_OUT
+                    elif kill_reason is JobState.OUTPUT_LIMIT:
+                        reason = REASON_OUTPUT_LIMIT
+                    else:
+                        reason = REASON_EXITED
+                    job.input.finish(reason)
+                    self._close_stdin(job, proc, poll, input_registered)
+                    input_fd = None
+                    input_registered = False
                 if rc is not None and open_fds == 0:
                     break
                 if open_fds == 0 and not events:
@@ -458,9 +526,13 @@ class JobService:
                 proc.wait(timeout=self.kill_grace + 5)
             except subprocess.TimeoutExpired:
                 pass
-            if proc.stdin:
-                proc.stdin.close()
-            job.input.finish('exited' if kill_reason is None else kill_reason.value)
+            # 兜底裁决：正常路径若已 finish（EOF/破裂/取消…）则幂等无操作。
+            job.input.finish(
+                REASON_CANCELLED if kill_reason is JobState.CANCELLED
+                else REASON_TIMED_OUT if kill_reason is JobState.TIMED_OUT
+                else REASON_OUTPUT_LIMIT if kill_reason is JobState.OUTPUT_LIMIT
+                else REASON_EXITED)
+            self._close_stdin(job, proc, None, False)
             for fh in streams:
                 try:
                     fh.close()
@@ -522,7 +594,7 @@ class JobService:
         with job.lock:
             job.state = JobState.EXITED
             job.returncode = 127
-            job.input.finish('spawn_error')
+            job.input.finish(REASON_SPAWN_ERROR)
             job.spawn_error = str(exc)
             job.started_at = job.started_at or time.monotonic()
             job.finished_at = time.monotonic()
