@@ -1,0 +1,9 @@
+
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.db-wal
+*.db-shm
